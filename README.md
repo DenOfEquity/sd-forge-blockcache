@@ -18,11 +18,11 @@ usage:
 4. Generate
 
 >[!NOTE]
->Both methods work with SD1.5, SD2, SDXL and Flux; including split cond processing.
+>Both methods work with SD1.5, SD2, SDXL and Flux; including separated cond processing.
 >
 >The use of cached residuals applies to the whole batch, so results will not be identical between different batch sizes. This is absolutely 100% *will not fix*.
 >
->Neither method handles negative prompts for Flux.
+>Neither method directly handles negative prompts for Flux, it might work depending on how Forge handles the conds (processed as one: should work; separate: probably very poor results).
 
 ---
 original README follows:

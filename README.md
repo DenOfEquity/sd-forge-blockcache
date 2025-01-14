@@ -1,3 +1,32 @@
+## First Block Cache and TeaCache, in Forge webUI ##
+### accelerate inference at some, perhaps minimal, quality cost ###
+
+derived, with lots of reworking, from:
+* https://github.com/likelovewant/sd-forge-teacache
+
+more info:
+* https://github.com/ali-vilab/TeaCache/tree/main/TeaCache4FLUX
+* https://github.com/chengzeyi/Comfy-WaveSpeed
+
+install:
+**Extensions** tab, **Install from URL**, use URL for this repo
+
+usage:
+1. Enable the extension
+2. select caching threshold: higher threshold = more caching = faster + lower quality
+3. low step models (Hyper) will need higher threshold to do anything
+4. Generate
+
+>[!NOTE]
+>Both methods work with SD1.5, SD2, SDXL and Flux; including split cond processing.
+>
+>The use of cached residuals applies to the whole batch, so results will not be identical between different batch sizes. This is absolutely 100% *will not fix*.
+>
+>Neither method handles negative prompts for Flux.
+
+---
+original README follows:
+
 ## Sd-Forge-TeaCache: Speed up Your Diffusion Models
 
 **Introduction**

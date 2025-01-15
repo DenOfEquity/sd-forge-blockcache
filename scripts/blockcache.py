@@ -41,6 +41,18 @@ class BlockCache(scripts.Script):
                     minimum=0.0, maximum=1.0, value=0.1, step=0.01,
                 )
 
+        enabled.do_not_save_to_config = True
+        method.do_not_save_to_config = True
+        nocache_steps.do_not_save_to_config = True
+        threshold.do_not_save_to_config = True
+
+        self.infotext_fields = [
+            (enabled, lambda d: d.get("bc_enabled", False)),
+            (method,        "bc_method"),
+            (threshold,     "bc_threshold"),
+            (nocache_steps, "bc_nocache_steps"),
+        ]
+
         return [enabled, method, threshold, nocache_steps]
 
 
@@ -53,21 +65,17 @@ class BlockCache(scripts.Script):
                     IntegratedUNet2DConditionModel.forward = patched_forward_unet_fbc
                 else:
                     IntegratedFluxTransformer2DModel.inner_forward = patched_inner_forward_flux_fbc
-                p.extra_generation_params.update({
-                    "FirstBlockCache"  : enabled,
-                })
             else:
                 if (p.sd_model.is_sd1 == True) or (p.sd_model.is_sd2 == True) or (p.sd_model.is_sdxl == True):
                     IntegratedUNet2DConditionModel.forward = patched_forward_unet_tc
                 else:
                     IntegratedFluxTransformer2DModel.inner_forward = patched_inner_forward_flux_tc
-                p.extra_generation_params.update({
-                    "TeaCache"         : enabled,
-                })
 
             p.extra_generation_params.update({
-                "threshold"        : threshold,
-                "nocache_steps"    : nocache_steps,
+                "bc_enabled"        : enabled,
+                "bc_method"         : method,
+                "bc_threshold"      : threshold,
+                "bc_nocache_steps"  : nocache_steps,
             })
 
             setattr(BlockCache, "threshold", threshold)
@@ -416,6 +424,7 @@ def patched_forward_unet_tc(self, x, timesteps=None, context=None, y=None, contr
         should_calc = True
     else:
         distance += ((original_h - previous).abs().mean() / previous.abs().mean()).cpu().item()
+
         if distance < BlockCache.threshold:
             should_calc = False
         else:

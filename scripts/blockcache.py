@@ -203,6 +203,7 @@ def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y
     pe = self.pe_embedder(ids)
 
     original_img = img.clone()
+    BlockCache.this_step += 1
 
     if BlockCache.this_step <= BlockCache.nocache_steps:
         should_calc = True
@@ -223,7 +224,6 @@ def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y
         else:
             should_calc = True
 
-    BlockCache.this_step += 1
     BlockCache.previous = original_img
 
     if should_calc or BlockCache.previous_residual is None:

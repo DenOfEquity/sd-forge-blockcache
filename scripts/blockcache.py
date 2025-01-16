@@ -91,11 +91,11 @@ class BlockCache(scripts.Script):
 
         if enabled:
             setattr(BlockCache, "index", 0)
-            setattr(BlockCache, "distance", [0, 0, 0, 0])
+            setattr(BlockCache, "distance", [0])
             setattr(BlockCache, "this_step", 0)
             setattr(BlockCache, "last_step", p.hr_second_pass_steps if p.is_hr_pass else p.steps)
-            setattr(BlockCache, "residual", [None, None, None, None])
-            setattr(BlockCache, "previous", [None, None, None, None])
+            setattr(BlockCache, "residual", [None])
+            setattr(BlockCache, "previous", [None])
             setattr(BlockCache, "previousSigma", None)
 
     def postprocess(self, params, processed, *args):
@@ -123,6 +123,10 @@ def patched_inner_forward_flux_fbc(self, img, img_ids, txt, txt_ids, timesteps, 
     thisSigma = timesteps.item()
     if BlockCache.previousSigma == thisSigma:
         BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
     else:
         BlockCache.previousSigma = thisSigma
         BlockCache.index = 0
@@ -184,6 +188,10 @@ def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y
     thisSigma = timesteps.item()
     if BlockCache.previousSigma == thisSigma:
         BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
     else:
         BlockCache.previousSigma = thisSigma
         BlockCache.index = 0
@@ -255,6 +263,10 @@ def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, cont
     thisSigma = transformer_options["sigmas"].item()
     if BlockCache.previousSigma == thisSigma:
         BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
     else:
         BlockCache.previousSigma = thisSigma
         BlockCache.index = 0
@@ -367,6 +379,10 @@ def patched_forward_unet_tc(self, x, timesteps=None, context=None, y=None, contr
     thisSigma = transformer_options["sigmas"].item()
     if BlockCache.previousSigma == thisSigma:
         BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
     else:
         BlockCache.previousSigma = thisSigma
         BlockCache.index = 0

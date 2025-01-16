@@ -2,6 +2,8 @@
 ##  with option to skip cache for early steps
 ##  always processes last step
 ##  handles highresfix
+##  handles PAG and SAG (with unet models, not Flux) by accelerating them too, independently
+##      opposite time/quality trade offs ... but some way of handling them is necessary to avoid potential errors
 
 ##  derived from https://github.com/likelovewant/sd-forge-teacache
 
@@ -85,18 +87,16 @@ class BlockCache(scripts.Script):
     def process_before_every_sampling(self, p, *args, **kwargs):
         enabled = args[0]
 
+        #   possibly four passes through the forward method on each step: cond, uncond, PAG, SAG
+
         if enabled:
-            setattr(BlockCache, "accumulated_distance", 0)
-            setattr(BlockCache, "accumulated_distanceP", 0)
-            setattr(BlockCache, "accumulated_distanceN", 0)
+            setattr(BlockCache, "index", 0)
+            setattr(BlockCache, "distance", [0, 0, 0, 0])
             setattr(BlockCache, "this_step", 0)
             setattr(BlockCache, "last_step", p.hr_second_pass_steps if p.is_hr_pass else p.steps)
-            setattr(BlockCache, "previous_residual", None)
-            setattr(BlockCache, "previous_residualP", None)
-            setattr(BlockCache, "previous_residualN", None)
-            setattr(BlockCache, "previous", None)
-            setattr(BlockCache, "previousP", None)
-            setattr(BlockCache, "previousN", None)
+            setattr(BlockCache, "residual", [None, None, None, None])
+            setattr(BlockCache, "previous", [None, None, None, None])
+            setattr(BlockCache, "previousSigma", None)
 
     def postprocess(self, params, processed, *args):
         # always clean up after processing
@@ -106,23 +106,29 @@ class BlockCache(scripts.Script):
             IntegratedFluxTransformer2DModel.inner_forward = BlockCache.original_inner_forward
             IntegratedUNet2DConditionModel.forward = BlockCache.original_forward_unet
 
+            delattr(BlockCache, "index")
             delattr(BlockCache, "threshold")
-            delattr(BlockCache, "accumulated_distance")
-            delattr(BlockCache, "accumulated_distanceP")
-            delattr(BlockCache, "accumulated_distanceN")
             delattr(BlockCache, "nocache_steps")
+            delattr(BlockCache, "distance")
             delattr(BlockCache, "this_step")
             delattr(BlockCache, "last_step")
-            delattr(BlockCache, "previous_residual")
-            delattr(BlockCache, "previous_residualP")
-            delattr(BlockCache, "previous_residualN")
+            delattr(BlockCache, "residual")
             delattr(BlockCache, "previous")
-            delattr(BlockCache, "previousP")
-            delattr(BlockCache, "previousN")
+            delattr(BlockCache, "previousSigma")
 
 
 def patched_inner_forward_flux_fbc(self, img, img_ids, txt, txt_ids, timesteps, y, guidance=None):
     # BlockCache version
+    
+    thisSigma = timesteps.item()
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
+    else:
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index    = BlockCache.index
 
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -145,7 +151,6 @@ def patched_inner_forward_flux_fbc(self, img, img_ids, txt, txt_ids, timesteps, 
     pe = self.pe_embedder(ids)
 
     original_img = img.clone()
-    BlockCache.this_step += 1
 
     first_block = True
     for block in self.double_blocks:
@@ -154,33 +159,37 @@ def patched_inner_forward_flux_fbc(self, img, img_ids, txt, txt_ids, timesteps, 
             first_block = False
 
             if BlockCache.this_step > BlockCache.nocache_steps and BlockCache.this_step != BlockCache.last_step:
-                # coefficients = [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01]
-                # rescale_func = np.poly1d(coefficients)
-                # BlockCache.accumulated_distance += rescale_func(
-                    # ((img - BlockCache.previous).abs().mean() / BlockCache.previous.abs().mean()).cpu().item()
-                # )
-
-                BlockCache.accumulated_distance += ((img - BlockCache.previous).abs().mean() / BlockCache.previous.abs().mean()).cpu().item()
-                BlockCache.previous = img.clone() ##clone?, seemed OK without
-                if BlockCache.accumulated_distance < BlockCache.threshold:
-                    img = original_img + BlockCache.previous_residual
+                BlockCache.distance[index] += ((img - BlockCache.previous[index]).abs().mean() / BlockCache.previous[index].abs().mean()).cpu().item()
+                BlockCache.previous[index] = img.clone() ##clone?, seemed OK without
+                if BlockCache.distance[index] < BlockCache.threshold:
+                    img = original_img + BlockCache.residual[index]
                     img = self.final_layer(img, vec)
                     return img      ##  early exit
             else:
-                BlockCache.previous = img
+                BlockCache.previous[index] = img
 
     img = torch.cat((txt, img), 1)
     for block in self.single_blocks:
         img = block(img, vec=vec, pe=pe)
     img = img[:, txt.shape[1]:, ...]
-    BlockCache.previous_residual = img - original_img
-    BlockCache.accumulated_distance = 0
+    BlockCache.residual[index] = img - original_img
+    BlockCache.distance[index] = 0
 
     img = self.final_layer(img, vec)
     return img
 
 def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y, guidance=None):
     # TeaCache version
+
+    thisSigma = timesteps.item()
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
+    else:
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index    = BlockCache.index
 
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -203,70 +212,58 @@ def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y
     pe = self.pe_embedder(ids)
 
     original_img = img.clone()
-    BlockCache.this_step += 1
 
     if BlockCache.this_step <= BlockCache.nocache_steps:
         should_calc = True
     elif BlockCache.this_step == BlockCache.last_step:
         should_calc = True
-    elif BlockCache.previous is None or BlockCache.previous.shape != original_img.shape:
+    elif BlockCache.previous[index] is None or BlockCache.previous[index].shape != original_img.shape:
         # should be redundant check if previous exists and has the correct shape
         should_calc = True
     else:
         coefficients = [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01]
         rescale_func = np.poly1d(coefficients)
-        BlockCache.accumulated_distance += rescale_func(
-            ((original_img - BlockCache.previous).abs().mean() / BlockCache.previous.abs().mean()).cpu().item()
+        BlockCache.distance[index] += rescale_func(
+            ((original_img - BlockCache.previous[index]).abs().mean() / BlockCache.previous[index].abs().mean()).cpu().item()
         )
 
-        if BlockCache.accumulated_distance < BlockCache.threshold:
+        if BlockCache.distance[index] < BlockCache.threshold:
             should_calc = False
         else:
             should_calc = True
 
-    BlockCache.previous = original_img
+    BlockCache.previous[index] = original_img
 
-    if should_calc or BlockCache.previous_residual is None:
-        BlockCache.accumulated_distance = 0
+    if should_calc or BlockCache.residual[index] is None:
+        BlockCache.distance[index] = 0
         for block in self.double_blocks:
             img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
         img = torch.cat((txt, img), 1)
         for block in self.single_blocks:
             img = block(img, vec=vec, pe=pe)
         img = img[:, txt.shape[1]:, ...]
-        BlockCache.previous_residual = img - original_img
+        BlockCache.residual[index] = img - original_img
     else:
-        img += BlockCache.previous_residual
+        img += BlockCache.residual[index]
 
     img = self.final_layer(img, vec)
     return img
 
 def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, control=None, transformer_options={}, **kwargs):
     # BlockCache version
-    skip = False
-    first_block = True
 
-    if transformer_options["cond_or_uncond"] == [1, 0]:
-        ##  both
-        residual = BlockCache.previous_residual
-        previous = BlockCache.previous
-        distance = BlockCache.accumulated_distance
-        BlockCache.this_step += 1
-    elif transformer_options["cond_or_uncond"] == [0]:
-        ##  cond only
-        residual = BlockCache.previous_residualP
-        previous = BlockCache.previousP
-        distance = BlockCache.accumulated_distanceP
-        BlockCache.this_step += 0.5
-    elif transformer_options["cond_or_uncond"] == [1]:
-        ##  uncond only
-        residual = BlockCache.previous_residualN
-        previous = BlockCache.previousN
-        distance = BlockCache.accumulated_distanceN
-        BlockCache.this_step += 0.5
+    thisSigma = transformer_options["sigmas"].item()
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
     else:
-        ##  shouldn't happen, skip caching
-        first_block = False
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index    = BlockCache.index
+    residual = BlockCache.residual[index]
+    previous = BlockCache.previous[index]
+    distance = BlockCache.distance[index]
 
     transformer_options["original_shape"] = list(x.shape)
     transformer_options["transformer_index"] = 0
@@ -283,6 +280,8 @@ def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, cont
 
     original_h = h.clone()
 
+    skip = False
+    first_block = True
     for id, module in enumerate(self.input_blocks):
         transformer_options["block"] = ("input", id)
         for block_modifier in block_modifiers:
@@ -303,9 +302,8 @@ def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, cont
 
         if first_block:
             first_block = False
-            if BlockCache.this_step > BlockCache.nocache_steps and BlockCache.this_step + 0.5 < BlockCache.last_step:
+            if BlockCache.this_step > BlockCache.nocache_steps and BlockCache.this_step < BlockCache.last_step and previous is not None:
                 distance += ((h - previous).abs().mean() / previous.abs().mean()).cpu().item()
-                # print ("Accumulated distance:", distance, "Step:", BlockCache.this_step)
                 previous = h.clone()
                 if distance < BlockCache.threshold:
                     h = original_h + residual
@@ -356,21 +354,9 @@ def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, cont
         residual = h - original_h
         distance = 0
 
-    if transformer_options["cond_or_uncond"] == [1, 0]:
-        ##both
-        BlockCache.previous_residual = residual
-        BlockCache.previous = previous
-        BlockCache.accumulated_distance = distance
-    elif transformer_options["cond_or_uncond"] == [0]:
-        ##cond only
-        BlockCache.previous_residualP = residual
-        BlockCache.previousP = previous
-        BlockCache.accumulated_distanceP = distance
-    elif transformer_options["cond_or_uncond"] == [1]:
-        ##uncond only
-        BlockCache.previous_residualN = residual
-        BlockCache.previousN = previous
-        BlockCache.accumulated_distanceN = distance
+    BlockCache.residual[index] = residual
+    BlockCache.previous[index] = previous
+    BlockCache.distance[index] = distance
 
     return h.type(x.dtype)
 
@@ -378,27 +364,18 @@ def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, cont
 def patched_forward_unet_tc(self, x, timesteps=None, context=None, y=None, control=None, transformer_options={}, **kwargs):
     # TeaCache version
 
-    if transformer_options["cond_or_uncond"] == [1, 0]:
-        ##  both
-        residual = BlockCache.previous_residual
-        previous = BlockCache.previous
-        distance = BlockCache.accumulated_distance
-        BlockCache.this_step += 1
-    elif transformer_options["cond_or_uncond"] == [0]:
-        ##  cond only
-        residual = BlockCache.previous_residualP
-        previous = BlockCache.previousP
-        distance = BlockCache.accumulated_distanceP
-        BlockCache.this_step += 0.5
-    elif transformer_options["cond_or_uncond"] == [1]:
-        ##  uncond only
-        residual = BlockCache.previous_residualN
-        previous = BlockCache.previousN
-        distance = BlockCache.accumulated_distanceN
-        BlockCache.this_step += 0.5
+    thisSigma = transformer_options["sigmas"].item()
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
     else:
-        ##  shouldn't happen
-        pass
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index    = BlockCache.index
+    residual = BlockCache.residual[index]
+    previous = BlockCache.previous[index]
+    distance = BlockCache.distance[index]
 
     transformer_options["original_shape"] = list(x.shape)
     transformer_options["transformer_index"] = 0
@@ -417,7 +394,7 @@ def patched_forward_unet_tc(self, x, timesteps=None, context=None, y=None, contr
 
     if BlockCache.this_step <= BlockCache.nocache_steps:
         should_calc = True
-    elif BlockCache.this_step + 0.5 >= BlockCache.last_step:
+    elif BlockCache.this_step == BlockCache.last_step:
         should_calc = True
     elif previous is None or previous.shape != original_h.shape:
         # should be redundant check if previous exists and has the correct shape
@@ -492,21 +469,9 @@ def patched_forward_unet_tc(self, x, timesteps=None, context=None, y=None, contr
     else:
         h += residual
 
-    if transformer_options["cond_or_uncond"] == [1, 0]:
-        ##both
-        BlockCache.previous_residual = residual
-        BlockCache.previous = original_h
-        BlockCache.accumulated_distance = distance
-    elif transformer_options["cond_or_uncond"] == [0]:
-        ##cond only
-        BlockCache.previous_residualP = residual
-        BlockCache.previousP = original_h
-        BlockCache.accumulated_distanceP = distance
-    elif transformer_options["cond_or_uncond"] == [1]:
-        ##uncond only
-        BlockCache.previous_residualN = residual
-        BlockCache.previousN = original_h
-        BlockCache.accumulated_distanceN = distance
+    BlockCache.residual[index] = residual
+    BlockCache.previous[index] = original_h
+    BlockCache.distance[index] = distance
 
     return h.type(x.dtype)
 

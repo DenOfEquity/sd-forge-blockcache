@@ -11,6 +11,11 @@ more info:
 install:
 **Extensions** tab, **Install from URL**, use URL for this repo
 
+>[!NOTE]
+>This branch `pagsag` handles SelfAttentionGuidance and PerturbedAttentionGuidance, and applies the caching to them too, independently.
+>
+>It will become main branch after testing.
+
 usage:
 1. Enable the extension
 2. select caching threshold: higher threshold = more caching = faster + lower quality

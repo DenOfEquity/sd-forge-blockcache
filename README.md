@@ -12,9 +12,9 @@ install:
 **Extensions** tab, **Install from URL**, use URL for this repo
 
 >[!NOTE]
->This branch `pagsag` handles SelfAttentionGuidance and PerturbedAttentionGuidance, and applies the caching to them too, independently.
+>This handles SelfAttentionGuidance and PerturbedAttentionGuidance (and anything else that calculates a cond), and applies the caching to them too, independently.
 >
->It will become main branch after testing.
+>Previous implementation moved to `old` branch.
 
 usage:
 1. Enable the extension
@@ -27,7 +27,11 @@ usage:
 >
 >The use of cached residuals applies to the whole batch, so results will not be identical between different batch sizes. This is absolutely 100% *will not fix*.
 
+Now works with batch_size > 1, but results will not be consistent with same seed at batch_size == 1.
 
+Added option for maximum consecutive cached steps (0: no limit); and made not using cache for final step an option (previously always processed the final step).
+
+Some samplers (DPM++ 2M, UniPC, likely others) need very low threshold and/or delayed start + limit to consecutive cached steps.
 ---
 ---
 original README:

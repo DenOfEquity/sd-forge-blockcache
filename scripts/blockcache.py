@@ -1,11 +1,20 @@
-##  First Block Cache / TeaCache for Forge webui
+##  First Block Cache / TeaCache for Forge2 webui
 ##  with option to skip cache for early steps
-##  always processes last step
+##  options to always process last step
+##  option for maximum consecutive steps to apply caching (0: no limit)
 ##  handles highresfix
 ##  handles PAG and SAG (with unet models, not Flux) by accelerating them too, independently
 ##      opposite time/quality trade offs ... but some way of handling them is necessary to avoid potential errors
 
-##  derived from https://github.com/likelovewant/sd-forge-teacache
+##  derived from https://github.com/likelovewant/sd-forge-teacache (flux only, teacache only)
+
+# fbc for flux
+# fbc and tc for sd1, sdxl
+# fbc and tc for sd3
+# fbc and tc for chroma - untested
+
+# actually, I'm skeptical about these coefficients
+
 
 import torch
 import numpy as np
@@ -18,13 +27,29 @@ from backend.nn.flux import timestep_embedding as timestep_embedding_flux
 from backend.nn.unet import IntegratedUNet2DConditionModel, apply_control
 from backend.nn.unet import timestep_embedding as timestep_embedding_unet
 
+try:
+    from backend.nn.mmditx import MMDiTX
+except:
+    MMDiTX = None
+
+try:
+    from backend.nn.chroma import IntegratedChromaTransformer2DModel
+    from backend.nn.chroma import timestep_embedding as timestep_embedding_chroma
+except:
+    IntegratedChromaTransformer2DModel = None
+
+
 class BlockCache(scripts.Script):
     original_inner_forward = None
     
     def __init__(self):
         if BlockCache.original_inner_forward is None:
+            if IntegratedChromaTransformer2DModel is not None:
+                BlockCache.chroma_inner_forward = IntegratedChromaTransformer2DModel.inner_forward
             BlockCache.original_inner_forward = IntegratedFluxTransformer2DModel.inner_forward
             BlockCache.original_forward_unet = IntegratedUNet2DConditionModel.forward
+            if MMDiTX is not None:
+                BlockCache.original_forward_mmditx = MMDiTX.forward
 
     def title(self):
         return "First Block Cache / TeaCache"
@@ -40,7 +65,7 @@ class BlockCache(scripts.Script):
                     minimum=1, maximum=12, value=1, step=1,
                 )
                 threshold = gr.Slider(label="caching threshold, higher values cache more aggressively.", 
-                    minimum=0.0, maximum=1.0, value=0.1, step=0.01,
+                    minimum=0.0, maximum=1.0, value=0.1, step=0.001,
                 )
             with gr.Row():
                 max_cached = gr.Number(label="Max. consecutive cached", scale=0,
@@ -74,13 +99,22 @@ class BlockCache(scripts.Script):
             if method == "First Block Cache":
                 if (p.sd_model.is_sd1 == True) or (p.sd_model.is_sd2 == True) or (p.sd_model.is_sdxl == True):
                     IntegratedUNet2DConditionModel.forward = patched_forward_unet_fbc
+                elif p.sd_model.is_sd3 == True:
+                    MMDiTX.forward = patched_forward_mmditx_fbc
                 else:
                     IntegratedFluxTransformer2DModel.inner_forward = patched_inner_forward_flux_fbc
+                    if IntegratedChromaTransformer2DModel is not None:
+                        IntegratedChromaTransformer2DModel.inner_forward = patched_inner_forward_chroma_fbc
             else:
                 if (p.sd_model.is_sd1 == True) or (p.sd_model.is_sd2 == True) or (p.sd_model.is_sdxl == True):
                     IntegratedUNet2DConditionModel.forward = patched_forward_unet_tc
+                elif p.sd_model.is_sd3 == True:
+                    MMDiTX.forward = patched_forward_mmditx_tc
                 else:
+                    # identify flux / chroma to avoid patching both
                     IntegratedFluxTransformer2DModel.inner_forward = patched_inner_forward_flux_tc
+                    if IntegratedChromaTransformer2DModel is not None:
+                        IntegratedChromaTransformer2DModel.inner_forward = patched_inner_forward_chroma_tc
 
             p.extra_generation_params.update({
                 "bc_enabled"        : enabled,
@@ -100,7 +134,7 @@ class BlockCache(scripts.Script):
     def process_before_every_sampling(self, p, *args, **kwargs):
         enabled = args[0]
 
-        #   possibly four passes through the forward method on each step: cond, uncond, PAG, SAG
+        #   possibly many passes through the forward method on each step: cond, uncond, PAG, SAG, TRAsce, SLG, 
 
         if enabled:
             setattr(BlockCache, "index", 0)
@@ -112,13 +146,20 @@ class BlockCache(scripts.Script):
             setattr(BlockCache, "previousSigma", None)
             setattr(BlockCache, "skipped", [0])
 
-    def postprocess(self, params, processed, *args):
+
+    def post_sample (self, params, ps, *args):
+    # def postprocess(self, params, processed, *args):
         # always clean up after processing
         enabled = args[0]
+
         if enabled:
             # restore the original inner_forward method
+            if IntegratedChromaTransformer2DModel is not None:
+                IntegratedChromaTransformer2DModel.inner_forward = BlockCache.chroma_inner_forward
             IntegratedFluxTransformer2DModel.inner_forward = BlockCache.original_inner_forward
             IntegratedUNet2DConditionModel.forward = BlockCache.original_forward_unet
+            if MMDiTX is not None:
+                MMDiTX.forward = BlockCache.original_forward_mmditx
 
             delattr(BlockCache, "index")
             delattr(BlockCache, "threshold")
@@ -132,6 +173,213 @@ class BlockCache(scripts.Script):
             delattr(BlockCache, "previous")
             delattr(BlockCache, "previousSigma")
             delattr(BlockCache, "skipped")
+
+
+#   patches forward, with inline forward_with_concat
+def patched_forward_mmditx_fbc(
+    self,
+    x: torch.Tensor,
+    t: torch.Tensor,
+    y = None,
+    context = None,
+    control=None, transformer_options={}, **kwargs) -> torch.Tensor:
+
+    thisSigma = t[0].item()
+
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
+            BlockCache.skipped.append(0)
+    else:
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index = BlockCache.index
+
+    skip_layers = transformer_options.get("skip_layers", [])
+
+    hw = x.shape[-2:]
+
+    x = self.x_embedder(x) + self.cropped_pos_embed(hw).to(x.device, x.dtype)
+    c = self.t_embedder(t, dtype=x.dtype)  # (N, D)
+    if y is not None:
+        y = self.y_embedder(y)  # (N, D)
+        c = c + y  # (N, D)
+
+    context = self.context_embedder(context)
+
+    if self.register_length > 0:
+        context = torch.cat(
+            (
+                repeat(self.register, "1 ... -> b ...", b=x.shape[0]),
+                context if context is not None else torch.Tensor([]).type_as(x),
+            ),
+            1,
+        )
+
+    original_x = x.clone()
+
+    epsilon = 1e-6
+
+    first_block = True
+    for i, block in enumerate(self.joint_blocks):
+        if i in skip_layers:
+            continue
+
+        context, x = block(context, x, c=c)
+        if control is not None:
+            controlnet_block_interval = len(self.joint_blocks) // len(
+                control
+            )
+            x = x + control[i // controlnet_block_interval]
+
+        if first_block:
+            first_block = False
+            if BlockCache.this_step <= BlockCache.nocache_steps:
+                skip_check = False
+            elif BlockCache.always_last and BlockCache.this_step >= BlockCache.last_step:
+                skip_check = False
+            else:
+                skip_check = True
+            if BlockCache.previous[index] is None or BlockCache.residual[index] is None:
+                skip_check = False
+            if BlockCache.skip_limit > 0 and BlockCache.skipped[index] >= BlockCache.skip_limit:
+                skip_check = False
+                
+            if skip_check:
+                ## accumulate (then average?) distance per channel
+                thisDistance = torch.zeros_like(x)
+                for i in range(len(x)):
+                    thisDistance += (x[i] - BlockCache.previous[index][i]).abs() / (epsilon + BlockCache.previous[index][i].abs())
+
+                avgDistance = thisDistance.mean().cpu().item()
+
+                # fullDistance = (x - BlockCache.previous[index]).abs().mean() / (epsilon + BlockCache.previous[index].abs().mean()).cpu().item()
+                # print (avgDistance, fullDistance)
+                
+                BlockCache.distance[index] += avgDistance
+
+                BlockCache.previous[index] = x.clone()
+                if BlockCache.distance[index] < BlockCache.threshold:
+                    BlockCache.skipped[index] += 1
+                    # print (x.mean(), x.std(), BlockCache.residual[index].mean(), BlockCache.residual[index].std())
+                    # for i in range(len(x)):
+                        # x[i] += BlockCache.residual[index][i] * (x[i].mean().abs() / BlockCache.residual[index][i].mean().abs()) * x[i].std()
+
+                    x += BlockCache.residual[index] * (x.mean().abs() / BlockCache.residual[index].mean().abs())# * x.std()
+
+                    x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
+                    x = self.unpatchify(x, hw=hw)  # (N, out_channels, H, W)
+                    return x      ##  early exit
+            else:
+                BlockCache.previous[index] = x.clone()
+
+    BlockCache.residual[index] = x - original_x
+    BlockCache.distance[index] = 0
+    BlockCache.skipped[index] = 0
+
+    x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
+
+    x = self.unpatchify(x, hw=hw)  # (N, out_channels, H, W)
+
+    return x
+
+
+def patched_inner_forward_chroma_fbc(self, img, img_ids, txt, txt_ids, timesteps, guidance=None):
+    # BlockCache version
+    
+    thisSigma = timesteps[0].item()
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
+            BlockCache.skipped.append(0)
+    else:
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index = BlockCache.index
+
+    if img.ndim != 3 or txt.ndim != 3:
+        raise ValueError("Input img and txt tensors must have 3 dimensions.")
+
+    img = self.img_in(img)
+    device = img.device
+    dtype = img.dtype
+    nb_double_block = len(self.double_blocks)
+    nb_single_block = len(self.single_blocks)
+        
+    mod_index_length = nb_double_block*12 + nb_single_block*3 + 2
+    distill_timestep = timestep_embedding_chroma(timesteps.detach().clone(), 16).to(device=device, dtype=dtype)
+    distil_guidance = timestep_embedding_chroma(guidance.detach().clone(), 16).to(device=device, dtype=dtype)
+    modulation_index = timestep_embedding_chroma(torch.arange(mod_index_length), 32).to(device=device, dtype=dtype)
+    modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1)
+    timestep_guidance = torch.cat([distill_timestep, distil_guidance], dim=1).unsqueeze(1).repeat(1, mod_index_length, 1)
+    input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1)
+    mod_vectors = self.distilled_guidance_layer(input_vec)
+    mod_vectors_dict = self.distribute_modulations(mod_vectors, nb_single_block, nb_double_block)
+        
+    txt = self.txt_in(txt)
+    del guidance
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    del txt_ids, img_ids
+    pe = self.pe_embedder(ids)
+    del ids
+
+    original_img = img.clone()
+
+    first_block = True
+    for i, block in enumerate(self.double_blocks):
+        img_mod = mod_vectors_dict[f"double_blocks.{i}.img_mod.lin"]
+        txt_mod = mod_vectors_dict[f"double_blocks.{i}.txt_mod.lin"]
+        double_mod = [img_mod, txt_mod]
+        img, txt = block(img=img, txt=txt, mod=double_mod, pe=pe)
+        if first_block:
+            first_block = False
+            if BlockCache.this_step <= BlockCache.nocache_steps:
+                skip_check = False
+            elif BlockCache.always_last and BlockCache.this_step >= BlockCache.last_step:
+                skip_check = False
+            else:
+                skip_check = True
+            if BlockCache.previous[index] is None or BlockCache.residual[index] is None:
+                skip_check = False
+            if BlockCache.skip_limit > 0 and BlockCache.skipped[index] >= BlockCache.skip_limit:
+                skip_check = False
+                
+            if skip_check:    
+                BlockCache.distance[index] += ((img - BlockCache.previous[index]).abs().mean() / BlockCache.previous[index].abs().mean()).cpu().item()
+                BlockCache.previous[index] = img.clone()
+                if BlockCache.distance[index] < BlockCache.threshold:
+                    BlockCache.skipped[index] += 1
+                    img = original_img + BlockCache.residual[index]
+                    final_mod = mod_vectors_dict["final_layer.adaLN_modulation.1"]
+                    img = self.final_layer(img, final_mod)
+                    return img      ##  early exit
+            else:
+                BlockCache.previous[index] = img
+
+    img = torch.cat((txt, img), 1)
+    for i, block in enumerate(self.single_blocks):
+        single_mod = mod_vectors_dict[f"single_blocks.{i}.modulation.lin"]
+        img = block(img, mod=single_mod, pe=pe)
+    del pe
+    img = img[:, txt.shape[1]:, ...]
+
+    BlockCache.residual[index] = img - original_img
+    BlockCache.distance[index] = 0
+    BlockCache.skipped[index] = 0
+
+    final_mod = mod_vectors_dict["final_layer.adaLN_modulation.1"]
+    img = self.final_layer(img, final_mod)
+    return img
 
 
 def patched_inner_forward_flux_fbc(self, img, img_ids, txt, txt_ids, timesteps, y, guidance=None):
@@ -194,9 +442,9 @@ def patched_inner_forward_flux_fbc(self, img, img_ids, txt, txt_ids, timesteps, 
                 BlockCache.distance[index] += ((img - BlockCache.previous[index]).abs().mean() / BlockCache.previous[index].abs().mean()).cpu().item()
                 BlockCache.previous[index] = img.clone()
                 if BlockCache.distance[index] < BlockCache.threshold:
+                    BlockCache.skipped[index] += 1
                     img = original_img + BlockCache.residual[index]
                     img = self.final_layer(img, vec)
-                    BlockCache.skipped[index] += 1
                     return img      ##  early exit
             else:
                 BlockCache.previous[index] = img
@@ -205,13 +453,13 @@ def patched_inner_forward_flux_fbc(self, img, img_ids, txt, txt_ids, timesteps, 
     for block in self.single_blocks:
         img = block(img, vec=vec, pe=pe)
     img = img[:, txt.shape[1]:, ...]
+
     BlockCache.residual[index] = img - original_img
     BlockCache.distance[index] = 0
     BlockCache.skipped[index] = 0
 
     img = self.final_layer(img, vec)
     return img
-
 
 
 def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, control=None, transformer_options={}, **kwargs):
@@ -346,6 +594,210 @@ def patched_forward_unet_fbc(self, x, timesteps=None, context=None, y=None, cont
     return h.type(x.dtype)
 
 
+def patched_forward_mmditx_tc(
+    self,
+    x: torch.Tensor,
+    t: torch.Tensor,
+    y = None,
+    context = None,
+    control=None, transformer_options={}, **kwargs) -> torch.Tensor:
+    """
+    Forward pass of DiT.
+    x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
+    t: (N,) tensor of diffusion timesteps
+    y: (N,) tensor of class labels
+    """
+
+    thisSigma = t[0].item()
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
+            BlockCache.skipped.append(0)
+    else:
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index = BlockCache.index
+    residual = BlockCache.residual[index]
+    previous = BlockCache.previous[index]
+    distance = BlockCache.distance[index]
+    skipped  = BlockCache.skipped[index]
+
+    if BlockCache.this_step <= BlockCache.nocache_steps:
+        skip_check = False
+    elif BlockCache.always_last and BlockCache.this_step == BlockCache.last_step:
+        skip_check = False
+    else:
+        skip_check = True
+    if previous is None or previous.shape != x.shape:
+        skip_check = False
+    if residual is None:
+        skip_check = False
+    if BlockCache.skip_limit > 0 and skipped >= BlockCache.skip_limit:
+        skip_check = False
+
+    epsilon = 1e-6
+
+    skip = False
+    if skip_check:
+        # distance += ((x - previous).abs().mean() / previous.abs().mean()).cpu().item()
+
+        # coefficients = [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01]
+        # rescale_func = np.poly1d(coefficients)
+        # distance += rescale_func(
+            # ((x - previous).abs().mean() / previous.abs().mean()).cpu().item()
+        # )
+        # print ("SD3 tc distance:", distance);
+
+        thisDistance = torch.zeros_like(x)
+        for i in range(len(x)):
+            thisDistance += (x[i] - BlockCache.previous[index][i]).abs() / (epsilon + BlockCache.previous[index][i].abs())
+
+        avgDistance = thisDistance.mean().cpu().item()
+
+        # fullDistance = ((x - previous).abs().mean() / previous.abs().mean()).cpu().item()
+        # print (avgDistance, fullDistance)
+        distance += avgDistance
+
+        if distance < BlockCache.threshold:
+            skip = True
+
+
+    previous = x.clone()
+
+    if skip:
+        x += residual
+        skipped += 1
+    else:
+        hw = x.shape[-2:]
+        x = self.x_embedder(x) + self.cropped_pos_embed(hw).to(x.device, x.dtype)
+        skip_layers = transformer_options.get("skip_layers", [])
+        c = self.t_embedder(t, dtype=x.dtype)  # (N, D)
+        if y is not None:
+            y = self.y_embedder(y)  # (N, D)
+            c = c + y  # (N, D)
+
+        context = self.context_embedder(context)
+
+        x = self.forward_core_with_concat(x, c, context, skip_layers, control)
+        x = self.unpatchify(x, hw=hw)  # (N, out_channels, H, W)
+
+        residual = x - previous
+        distance = 0
+        skipped = 0
+
+
+    BlockCache.residual[index] = residual
+    BlockCache.previous[index] = previous
+    BlockCache.distance[index] = distance
+    BlockCache.skipped[index]  = skipped
+
+    return x
+
+
+def patched_inner_forward_chroma_tc(self, img, img_ids, txt, txt_ids, timesteps, guidance=None):
+    # TeaCache version
+
+    thisSigma = timesteps[0].item()
+    if BlockCache.previousSigma == thisSigma:
+        BlockCache.index += 1
+        if BlockCache.index == len(BlockCache.distance):
+            BlockCache.distance.append(0)
+            BlockCache.residual.append(None)
+            BlockCache.previous.append(None)
+            BlockCache.skipped.append(0)
+    else:
+        BlockCache.previousSigma = thisSigma
+        BlockCache.index = 0
+        BlockCache.this_step += 1
+
+    index = BlockCache.index
+
+    if img.ndim != 3 or txt.ndim != 3:
+        raise ValueError("Input img and txt tensors must have 3 dimensions.")
+
+    img = self.img_in(img)
+    device = img.device
+    dtype = img.dtype
+    nb_double_block = len(self.double_blocks)
+    nb_single_block = len(self.single_blocks)
+        
+    mod_index_length = nb_double_block*12 + nb_single_block*3 + 2
+    distill_timestep = timestep_embedding_chroma(timesteps.detach().clone(), 16).to(device=device, dtype=dtype)
+    distil_guidance = timestep_embedding_chroma(guidance.detach().clone(), 16).to(device=device, dtype=dtype)
+    modulation_index = timestep_embedding_chroma(torch.arange(mod_index_length), 32).to(device=device, dtype=dtype)
+    modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1)
+    timestep_guidance = torch.cat([distill_timestep, distil_guidance], dim=1).unsqueeze(1).repeat(1, mod_index_length, 1)
+    input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1)
+    mod_vectors = self.distilled_guidance_layer(input_vec)
+    mod_vectors_dict = self.distribute_modulations(mod_vectors, nb_single_block, nb_double_block)
+        
+    txt = self.txt_in(txt)
+    del guidance
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    del txt_ids, img_ids
+    pe = self.pe_embedder(ids)
+    del ids
+
+    original_img = img.clone()
+
+    if BlockCache.this_step <= BlockCache.nocache_steps:
+        skip_check = False
+    elif BlockCache.always_last and BlockCache.this_step == BlockCache.last_step:
+        skip_check = False
+    else:
+        skip_check = True
+    if BlockCache.previous[index] is None or BlockCache.previous[index].shape != original_img.shape:
+        skip_check = False
+    if BlockCache.residual[index] is None:
+        skip_check = False
+    if BlockCache.skip_limit > 0 and BlockCache.skipped[index] >= BlockCache.skip_limit:
+        skip_check = False
+
+    skip = False
+    if skip_check:
+        coefficients = [4.98651651e+02, -2.83781631e+02, 5.58554382e+01, -3.82021401e+00, 2.64230861e-01]
+        rescale_func = np.poly1d(coefficients)
+        BlockCache.distance[index] += rescale_func(
+            ((original_img - BlockCache.previous[index]).abs().mean() / BlockCache.previous[index].abs().mean()).cpu().item()
+        )
+
+        if BlockCache.distance[index] < BlockCache.threshold:
+            skip = True
+
+    BlockCache.previous[index] = original_img
+
+    if skip:
+        img += BlockCache.residual[index]
+        BlockCache.skipped[index] += 1
+    else:
+        for i, block in enumerate(self.double_blocks):
+            img_mod = mod_vectors_dict[f"double_blocks.{i}.img_mod.lin"]
+            txt_mod = mod_vectors_dict[f"double_blocks.{i}.txt_mod.lin"]
+            double_mod = [img_mod, txt_mod]
+            img, txt = block(img=img, txt=txt, mod=double_mod, pe=pe)
+        img = torch.cat((txt, img), 1)
+        for i, block in enumerate(self.single_blocks):
+            single_mod = mod_vectors_dict[f"single_blocks.{i}.modulation.lin"]
+            img = block(img, mod=single_mod, pe=pe)
+        del pe
+        img = img[:, txt.shape[1]:, ...]
+        # final_mod = mod_vectors_dict["final_layer.adaLN_modulation.1"]
+        # img = self.final_layer(img, final_mod)
+
+        BlockCache.residual[index] = img - original_img
+        BlockCache.distance[index] = 0
+        BlockCache.skipped[index] = 0
+
+    final_mod = mod_vectors_dict["final_layer.adaLN_modulation.1"]
+    img = self.final_layer(img, final_mod)
+    return img
+
+
 def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y, guidance=None):
     # TeaCache version
 
@@ -416,7 +868,6 @@ def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y
         img += BlockCache.residual[index]
         BlockCache.skipped[index] += 1
     else:
-        BlockCache.distance[index] = 0
         for block in self.double_blocks:
             img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
         img = torch.cat((txt, img), 1)
@@ -424,10 +875,12 @@ def patched_inner_forward_flux_tc(self, img, img_ids, txt, txt_ids, timesteps, y
             img = block(img, vec=vec, pe=pe)
         img = img[:, txt.shape[1]:, ...]
         BlockCache.residual[index] = img - original_img
+        BlockCache.distance[index] = 0
         BlockCache.skipped[index] = 0
 
     img = self.final_layer(img, vec)
     return img
+
 
 def patched_forward_unet_tc(self, x, timesteps=None, context=None, y=None, control=None, transformer_options={}, **kwargs):
     # TeaCache version
